@@ -1,5 +1,7 @@
 import pandas as pd
 import numpy as np
+from scipy.stats import theilslopes
+
 #=============================
 #  Read Squid data function  #
 #=============================
@@ -58,36 +60,53 @@ def read_squid_file(filepath: str) -> pd.DataFrame:
 #=============================
 #     Find T_c Function      #
 #=============================
-def determine_critical_temp(dataframe: pd.DataFrame, lo: float = 0.4, hi: float = 0.6):
+
+def determine_critical_temp(dataframe: pd.DataFrame,
+                            normal_pct: float = 70,
+                            trans_lo: float = 0.55,
+                            trans_hi: float = 0.95,
+                            min_points: int = 3):
     """
-        Function for determining Tc, it takes the steep part of the curve, in the middle 
-    
+        Function for determining Tc from the intersection of two robust (Theil-Sen) lines:
+        one fitted to the normal state, one fitted to the steep part of the transition.
+
         kwargs:
-        dataframe: the dataframe that is inserted into the funciton, expcected to be from MPMS3 (like fucntion thats used above)
-        lo: the lower window, this can be tuned
-        hi: the upper window, this can be tuned
-        
-        note:
-        The default parameters are chosen 
+        dataframe: single-run dataframe, expected to be from MPMS3
+        normal_pct: temperature percentile above which data is treated as normal state
+        trans_lo: lower normalised moment bound of the transition window (0 = SC, 1 = normal)
+        trans_hi: upper normalised moment bound of the transition window
+        min_points: minimum points required in each region
+
+        returns:
+        t_crit: critical temperature (np.nan if the fit fails)
+        fit: dict of the two lines (slope, intercept) and the masks, for plotting later
         """
-    df = dataframe.sort_values("Temperature (K)")
-    temperature = df["Temperature (K)"].to_numpy()
-    moment = df["DC Moment Fixed Ctr (emu)"].to_numpy()
+    df = dataframe.sort_values("Temperature (K)").drop_duplicates(subset="Temperature (K)")
+    temperature = df["Temperature (K)"].to_numpy(dtype=float)
+    moment = df["DC Moment Fixed Ctr (emu)"].to_numpy(dtype=float)
 
-    # m_sc = np.median(moment[:10])       
-    # m_n = np.median(moment[-10:])       
-    m_sc, m_n = np.percentile(moment, [5,95])
-    moment_norm = (moment - m_n) / (m_sc - m_n)
+    # Normalise moment: 0 = superconducting, 1 = normal
+    m_sc, m_n = np.percentile(moment, [5, 95])
+    moment_norm = (moment - m_sc) / (m_n - m_sc)
 
-    mask = (moment_norm < hi) & (moment_norm > lo)
-    if mask.sum() < 3:
-        return np.nan, np.full_like(temperature, np.nan), np.zeros_like(temperature)
+    # Normal state selected on temperature only; transition on the moment window
+    t_limit = np.percentile(temperature, normal_pct)
+    normal_mask = temperature >= t_limit
+    trans_mask = (moment_norm >= trans_lo) & (moment_norm < trans_hi) & ~normal_mask
 
-    slope, intercept = np.polyfit(temperature[mask], moment_norm[mask], 1)
-    fitted_line = slope * temperature + intercept
+    fit = {"normal_mask": normal_mask, "trans_mask": trans_mask,
+           "normal": (np.nan, np.nan), "trans": (np.nan, np.nan)}
 
-    t_crit = -intercept / slope if slope != 0 else np.nan
-    return t_crit, fitted_line, np.zeros_like(temperature)
+    if normal_mask.sum() < min_points or trans_mask.sum() < min_points:
+        return np.nan, fit
+
+    n_slope, n_int, *_ = theilslopes(moment[normal_mask], temperature[normal_mask])
+    t_slope, t_int, *_ = theilslopes(moment[trans_mask], temperature[trans_mask])
+    fit["normal"], fit["trans"] = (n_slope, n_int), (t_slope, t_int)
+
+    # Tc = intersection of the two lines
+    t_crit = (t_int - n_int) / (n_slope - t_slope) if n_slope != t_slope else np.nan
+    return t_crit, fit
 
 #=============================
 #      Find H_c Function     #
@@ -114,4 +133,3 @@ def determine_critical_field(dataframe: pd.DataFrame, threshold: float = 0.005):
     field_neg = field[moment > cutoff].min()  
     f_crit = (field_pos - field_neg) / 2
     return f_crit, field_pos, field_neg
-
